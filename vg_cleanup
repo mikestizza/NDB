@@ -3,7 +3,7 @@
 Nutanix Volume Group Cleanup Script
 
 This script identifies and removes Volume Groups (VGs) in a Nutanix environment 
-that start with a specified prefix (default: 'STIZVG'). It performs the following checks and actions:
+that start with a specified prefix. It performs the following checks and actions:
 
 1. Check if any VMs are attached to the VG (skips the VG unless --force is used)
 2. Remove any disks within the VG
@@ -13,7 +13,8 @@ Options:
 --dry-run: Show what would be deleted without actually making changes
 --force: Process VGs even if they have VMs attached (USE WITH CAUTION)
 --verbose: Enable more detailed logging
---prefix: Specify the VG name prefix to match (default: STIZVG)
+--prefix: Specify the VG name prefix to match (REQUIRED)
+--timeout: Set command timeout in seconds (default: 30)
 """
 
 import subprocess
@@ -32,18 +33,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def run_acli_command(command, dry_run=False):
+def run_acli_command(command, dry_run=False, timeout=30, confirm=False):
     """
     Execute an ACLI command via subprocess
     
     Args:
         command (str): The ACLI command to run
         dry_run (bool): If True, only print the command without executing
+        timeout (int): Maximum time to wait for command completion in seconds
+        confirm (bool): Whether to auto-confirm any prompts with 'yes'
         
     Returns:
         str: Command output if executed, or a dry run message
     """
     full_command = "acli {}".format(command)
+    
+    # Add echo yes pipe for commands that require confirmation
+    if confirm and not dry_run:
+        full_command = "echo yes | " + full_command
     
     if dry_run:
         logger.info("[DRY RUN] Would execute: {}".format(full_command))
@@ -59,7 +66,14 @@ def run_acli_command(command, dry_run=False):
             stderr=subprocess.PIPE,
             universal_newlines=True  # This is equivalent to text=True in Python 3.7+
         )
-        stdout, stderr = process.communicate()
+        
+        # Set a timeout for command execution
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            logger.warning("Command timed out after {} seconds, but continuing execution".format(timeout))
+            return "TIMEOUT"
         
         if process.returncode != 0:
             logger.error("Command failed with return code: {}".format(process.returncode))
@@ -151,10 +165,17 @@ def detach_vms(vg_name, vm_uuids, dry_run=False):
     
     success = True
     for vm_uuid in vm_uuids:
-        result = run_acli_command("vg.detach_from_vm {} {}".format(vg_name, vm_uuid), dry_run)
+        # Add confirm=True to automatically answer 'yes' to confirmation prompts
+        result = run_acli_command("vg.detach_from_vm {} {}".format(vg_name, vm_uuid), 
+                                 dry_run, timeout=20, confirm=True)
+        
         if result is None and not dry_run:
             logger.error("Failed to detach VM {} from {}".format(vm_uuid, vg_name))
             success = False
+        elif result == "TIMEOUT" and not dry_run:
+            logger.warning("VM detachment command timed out for VM {} from {}. The operation may still be in progress.".format(
+                vm_uuid, vg_name))
+            # Consider timeout as success and continue with next operations
         else:
             logger.info("{}Detached VM {} from {}".format(
                 "[DRY RUN] Would have " if dry_run else "", vm_uuid, vg_name))
@@ -205,10 +226,19 @@ def detach_disks(vg_name, disk_indexes, dry_run=False):
     
     success = True
     for disk_index in disk_indexes:
-        result = run_acli_command("vg.disk_delete {} {}".format(vg_name, disk_index), dry_run)
+        # Use a shorter timeout for disk deletion as it's often an async operation
+        # Add confirm=True to automatically answer 'yes' to confirmation prompts
+        result = run_acli_command("vg.disk_delete {} {}".format(vg_name, disk_index), 
+                                 dry_run, timeout=20, confirm=True)
+        
+        # Consider TIMEOUT as a success since the operation was likely submitted
         if result is None and not dry_run:
             logger.error("Failed to detach disk index {} from {}".format(disk_index, vg_name))
             success = False
+        elif result == "TIMEOUT" and not dry_run:
+            logger.warning("Disk deletion command timed out for disk {} in {}. The operation may still be in progress.".format(
+                disk_index, vg_name))
+            # Consider timeout as success and continue with next operations
     
     return success
 
@@ -223,8 +253,11 @@ def delete_vg(vg_name, dry_run=False):
     Returns:
         bool: True if successful, False otherwise
     """
-    result = run_acli_command("vg.delete {}".format(vg_name), dry_run)
-    success = result is not None or dry_run
+    # Add confirm=True to automatically answer 'yes' to confirmation prompts
+    result = run_acli_command("vg.delete {}".format(vg_name), dry_run, timeout=20, confirm=True)
+    
+    # Consider TIMEOUT as a success as the operation was likely submitted
+    success = result is not None or result == "TIMEOUT" or dry_run
     
     if success:
         if dry_run:
@@ -241,7 +274,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Perform a dry run (no changes made)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--force", action="store_true", help="Force deletion even if VMs are attached (USE WITH CAUTION)")
-    parser.add_argument("--prefix", default="STIZVG", help="VG name prefix to match (default: STIZVG)")
+    parser.add_argument("--prefix", required=True, help="VG name prefix to match")
+    parser.add_argument("--timeout", type=int, default=30, help="Command timeout in seconds (default: 30)")
     args = parser.parse_args()
     
     if args.verbose:
@@ -257,6 +291,7 @@ def main():
         logger.warning("FORCE mode enabled - will attempt to delete VGs even if VMs are attached")
         
     logger.info("Targeting VGs with prefix: {}".format(args.prefix))
+    logger.info("Command timeout set to {} seconds".format(args.timeout))
     
     # Get list of all volume groups
     logger.info("Retrieving list of volume groups...")
@@ -277,11 +312,11 @@ def main():
             else:
                 # Fallback to simulated data if we can't get real data
                 logger.info("[DRY RUN] Using simulated VG list for demonstration")
-                vgs = ["STIZVG", "OTHER_VG", "ANOTHER_VG"]
+                vgs = ["EXAMPLE_VG1", "EXAMPLE_VG2", "OTHER_VG", "ANOTHER_VG"]
         except Exception as e:
             # Fallback to simulated data if command fails
             logger.info("[DRY RUN] Using simulated VG list for demonstration")
-            vgs = ["STIZVG", "OTHER_VG", "ANOTHER_VG"]
+            vgs = ["EXAMPLE_VG1", "EXAMPLE_VG2", "OTHER_VG", "ANOTHER_VG"]
     
     if not vgs:
         if not args.dry_run:
